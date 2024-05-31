@@ -1,0 +1,235 @@
+name: sanity-custom-version
+on:
+  schedule:
+    - cron: '30 7 * * *'
+  workflow_call:
+    inputs:
+      cluster:
+        required: false
+        type: string
+        default: 'staging'
+  workflow_dispatch:
+    inputs:
+      test-suite:
+        description: 'Test suite to run'
+        required: true
+        default: 'QuickCheck'
+        type: choice
+        options:
+        - QuickCheck
+        - Sanity
+        - Go
+        - Java
+        - Python
+        - JS
+        - Ruby
+        - Dotnet
+        - Scala
+        - Kotlin
+        - BackwardCompatibility
+        - Secrets
+        - Policies
+        - PerfScan
+        - Bazel
+        - PNPM
+        - Gradle
+        - MalwareScan
+        - CICDTools
+        - GithubActionsScan
+      additional_flags:
+        description: |
+          Env variables with values semi-colon separated. eg:
+          ENDOR_SCAN_ENABLE_NEW_JVM=true;ENDOR_SCAN_JVM_PARAMETERS="-Xmx16G,-Dendor.cg.asm=true"
+        required: false
+        type: string
+
+env:
+  GO_REPOSITORY_USE_HOST_CACHE: 1
+
+jobs:
+  sanity:
+    name: Custom-Version-Sanity
+    permissions:
+      contents: read  # for dorny/paths-filter to fetch a list of changed files
+      pull-requests: read  # for dorny/paths-filter to read pull requests
+      id-token: 'write' # endorctl
+    runs-on:  [ self-hosted, endorci-runner ]
+    strategy:
+      matrix:
+        runner: [1, 2, 3]
+    outputs:
+      matrix-status1: ${{ steps.output-status.outputs.status1 }}
+      matrix-status2: ${{ steps.output-status.outputs.status2 }}
+      matrix-status3: ${{ steps.output-status.outputs.status3 }}
+
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'adopt'
+
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14.x'
+      - name: Install pnpm
+        run: npm install -g pnpm@5.18.1
+
+      # setup the dotnet framework
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        env:
+          DOTNET_INSTALL_DIR: "~/.dotnet"
+        with:
+          dotnet-version: '7.x'
+
+      - name: setup bazel remote cache
+        env:
+          BAZEL_GCP_TOKEN: ${{ secrets.CI_BAZEL }}
+        run: |
+          export ENDOR_HOME=$PWD
+          echo $JAVA_HOME
+          echo $BAZEL_GCP_TOKEN | base64 -d > $ENDOR_HOME/bazel-token
+          echo "build --config=ci" >> $ENDOR_HOME/.bazelrc
+          echo "build --google_credentials="$ENDOR_HOME"/bazel-token" >> $ENDOR_HOME/.bazelrc
+          $ENDOR_HOME/repo-tools/bin/setup-bazel
+
+      - name: Cache bazel repository_cache
+        uses: actions/cache/restore@v3
+        with:
+           path: |
+             /home/runner/.cache/bazel
+           key: ${{ runner.os }}-bazel-repository_cache-${{ hashFiles('WORKSPACE') }}
+           restore-keys: |
+             ${{ runner.os }}-bazel-repository_cache-
+      - name: set test suite
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "ENDOR_NAMESPACE=sanity.linux-custom" >> $GITHUB_ENV
+            if [ "${{ inputs.test-suite }}" == "PerfScan" ]; then
+              echo "TEST_FILTER=TestPerfScan" >> $GITHUB_ENV
+              echo "ENDOR_NAMESPACE=sanity.perf-scan" >> $GITHUB_ENV
+              echo "TEST_TIMEOUT=7200" >> $GITHUB_ENV
+            fi
+            if [ -n "${{inputs.additional_flags}}" ]; then
+              echo "ENDOR_FLAGS=${{inputs.additional_flags}}" >> $GITHUB_ENV
+            fi
+            if [ "${{ inputs.test-suite }}" == "Sanity" ]; then
+                echo "TEST_FILTER=TestSanity${{ matrix.runner }}" >> $GITHUB_ENV
+            else
+                echo "TEST_FILTER=${{ inputs.test-suite }}" >> $GITHUB_ENV
+            fi
+          elif [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "TEST_FILTER=TestPerfScan${{ matrix.runner }}" >> $GITHUB_ENV
+            echo "ENDOR_NAMESPACE=sanity.perf-scan" >> $GITHUB_ENV
+            echo "TEST_TIMEOUT=7200" >> $GITHUB_ENV
+          else
+            echo "ENDOR_NAMESPACE=sanity.linux-custom" >> $GITHUB_ENV
+            echo "TEST_FILTER=TestSanity${{ matrix.runner }}" >> $GITHUB_ENV
+          fi
+
+      - name: Set Slack webhook URL
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SLACK_WEBHOOK_URL="${{ secrets.SANITY_HEALTH_ALERTS_QA_SLACK_WEBHOOK_URL }}"
+          else
+            SLACK_WEBHOOK_URL="${{ secrets.SANITY_SLACK_WEBHOOK_URL }}"
+          fi
+          echo "SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL" >> $GITHUB_ENV
+
+
+      # Runner-1 will run on release and scheduled runs with TestSanity1 or on the manually selected tests suite.
+      - name: 'Sanity tests - Runner-1'
+        if: ${{ matrix.runner == 1 }}
+        env:
+          ENDOR_GITHUB_ENTERPRISE_TOKEN: ${{ secrets.E2E_GITHUB_ENTERPRISE_TOKEN }}
+          ENDOR_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENDOR_CI_BUILD_ID: ${{ github.run_id }}
+          ENDOR_PLATFORM: 'linux-custom'
+          TEST_RETRY: true
+          TEST_FILTER: ${{ env.TEST_FILTER }}
+        run: ./.github/workflows/sanity/sanity.sh
+
+
+      # Runner-2 and Runner-3 will run only on release and scheduled runs to avoid concurrent runs.
+      - name: 'Sanity tests - Runner-${{ matrix.runner }}'
+        if: ${{ ( github.event_name != 'workflow_dispatch' && matrix.runner != 1 ) || (inputs.test-suite == 'Sanity'&& matrix.runner != 1) }}
+        env:
+          ENDOR_GITHUB_ENTERPRISE_TOKEN: ${{ secrets.E2E_GITHUB_ENTERPRISE_TOKEN }}
+          ENDOR_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENDOR_CI_BUILD_ID: ${{ github.run_id }}
+          ENDOR_PLATFORM: 'linux-custom'
+          TEST_RETRY: true
+          TEST_FILTER: ${{ env.TEST_FILTER }}
+        run: ./.github/workflows/sanity/sanity.sh
+
+
+      - name: Set output status
+        id: output-status
+        if: always()
+        run: echo "status${{ matrix.runner }}=${{ job.status }}" >> $GITHUB_OUTPUT
+
+
+      - name: 'Report status'
+        if: always()
+        uses: ravsamhq/notify-slack-action@bca2d7f5660b833a27bda4f6b8bef389ebfefd25 # v2.3.0
+        with:
+          status: ${{ job.status }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          notification_title: '{workflow} has {status_message}'
+          message_format: '{emoji} *{workflow}* {status_message} in <{repo_url}|{repo}> : <{run_url}|View Run Results>'
+          footer: '<{run_url}|View Run>'
+          notify_when: 'failure'
+        env:
+          SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+
+      - name: Determine the folder structure for report
+        if: always()
+        shell: bash
+        run: |
+          BUCKET=endorlabs-qa-data
+          if [ "$TEST_FILTER" == "TestPerfScan${{ matrix.runner }}" ]; then
+            FOLDER=PerfResults
+          else
+            FOLDER=SanityResults
+          fi
+          echo "DESTINATION=${BUCKET}" >> $GITHUB_ENV
+          echo "SOURCE_PATH=/tmp/${FOLDER}" >> $GITHUB_ENV
+          echo "LOG_NAME=${FOLDER}" >> $GITHUB_ENV
+
+      - name: "GCP Authentication"
+        if: always()
+        id: auth_at
+        uses: "google-github-actions/auth@2671692c371cbef34ed8ded9f197670c88c9d343" #v0.8.2
+        with:
+          token_format: "access_token"
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+          service_account: ${{ secrets.CI_SERVICE_ACCOUNT }}
+
+      - name: Write Logs to Gcloud Logging
+        if: ${{ always() && github.event_name != 'workflow_dispatch'}}
+        shell: bash
+        run: |
+          FILES=$(find ${SOURCE_PATH} -name \*\.json -type f)
+          for file in $FILES
+          do
+            JSONDATA="'"$(cat ${file})"'"
+            CMD="gcloud logging write $LOG_NAME --severity=INFO  --project=endor-experiments --payload-type=json $JSONDATA"
+            echo -e "$CMD\n"
+            eval "$CMD"
+          done
+
+  sanity-test-results:
+    name: Custom-linux Sanity Test Results
+    runs-on: [ self-hosted, endorci-runner ]
+    needs: sanity
+    if: always()
+    steps:
+      -  run: |
+          if [ "${{ needs.sanity.outputs.matrix-status1 }}" != "success" ] || [ "${{ needs.sanity.outputs.matrix-status2 }}" != "success" ] || [ "${{ needs.sanity.outputs.matrix-status3 }}" != "success" ]; then
+            exit 1
+          fi

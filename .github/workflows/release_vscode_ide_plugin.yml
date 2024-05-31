@@ -1,0 +1,48 @@
+name: Build and Upload VSCode IDE plugin
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: 'Release Tag (e.g. v0.3.0)'
+        required: true
+        type: string
+
+env:
+  GO_REPOSITORY_USE_HOST_CACHE: 1
+
+jobs:
+  build:
+    permissions:
+      id-token: 'write'
+      contents: 'read'
+    runs-on: [ self-hosted, endorci-runner ]
+    name: Build VSCode IDE plugin
+    env:
+      RELEASE_TAG: ${{ inputs.release-tag || 'v0.0.1' }}
+      BUCKET: endorlabs-ide-plugins-int
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build plugin
+        run: |
+          export ENDOR_HOME=$PWD
+          ./repo-tools/bin/setup-bazel
+          bazel build //ide-plugins/vscode:build_plugin --//ide-plugins/vscode:version="$RELEASE_TAG"
+        shell: bash
+      - name: Rename the Plugin File
+        run: |
+          mv bazel-bin/ide-plugins/vscode/endorlabs-vscode-plugin.vsix \
+            bazel-bin/ide-plugins/vscode/endorlabs-vscode-plugin-${{ env.RELEASE_TAG }}.vsix
+      - name: 'GCP Authentication'
+        id: auth
+        uses: 'google-github-actions/auth@2671692c371cbef34ed8ded9f197670c88c9d343' #v0.8.2
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: ${{ secrets.CI_WORKLOAD_PROVIDER }}
+          service_account: ${{ secrets.CI_SERVICE_ACCOUNT }}
+      - name: Upload VSCode Plugin to GCS
+        uses: google-github-actions/upload-cloud-storage@v1
+        with:
+          path: bazel-bin/ide-plugins/vscode/endorlabs-vscode-plugin-${{ env.RELEASE_TAG }}.vsix
+          destination: ${{ env.BUCKET }}/vscode-plugin/${{ env.RELEASE_TAG }}/
+          process_gcloudignore: false
